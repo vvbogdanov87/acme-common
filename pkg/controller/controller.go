@@ -37,9 +37,12 @@ type Obj interface {
 
 	// SetStatus sets the fields of the status after the stack is created/updated
 	SetStatus(auto.OutputMap)
+
+	// GetPulumiProgram defines the program that creates pulumi resources.
+	GetPulumiProgram() pulumi.RunFunc
 }
 
-func Reconcile(ctx context.Context, o Obj, req ctrl.Request, r client.Client, program pulumi.RunFunc) (ctrl.Result, error) {
+func Reconcile(ctx context.Context, o Obj, req ctrl.Request, r client.Client) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
 	// Fetch the Object instance
@@ -86,6 +89,8 @@ func Reconcile(ctx context.Context, o Obj, req ctrl.Request, r client.Client, pr
 	}
 
 	// Initialize the stack
+	program := o.GetPulumiProgram()
+
 	s, err := stack.GetStack(ctx, program, kind, o.GetName(), o.GetNamespace())
 	if err != nil {
 		log.Error(err, "failed to create stack")
