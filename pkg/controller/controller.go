@@ -12,6 +12,7 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/vvbogdanov87/acme-common/pkg/stack"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,49 +49,57 @@ func Reconcile(ctx context.Context, o Obj, req ctrl.Request, r client.Client) (c
 
 	// Fetch the Object instance
 	if err := r.Get(ctx, req.NamespacedName, o); err != nil {
+		if apierrors.IsNotFound(err) {
+			// If the custom resource is not found then it usually means that it was deleted or not created
+			// In this way, we will stop the reconciliation
+			log.Info("resource not found. Ignoring since object must be deleted")
+			return ctrl.Result{}, nil
+		}
+		// Error reading the object - requeue the request.
 		log.Error(err, "unable to fetch Object")
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return ctrl.Result{}, err
 	}
 
 	// Set the Ready condition to Flase when no status is available
 	if len(*o.GetStatusConditions()) == 0 {
-		if err := setReadyStatus(ctx, metav1.ConditionFalse, o, req, r, "Reconciling", "Starting reconciliation", true); err != nil {
+		if err := setReadyStatus(ctx, metav1.ConditionFalse, o, r, "Reconciling", "Starting reconciliation"); err != nil {
 			log.Error(err, "Failed to update Object status")
 			return ctrl.Result{}, err
 		}
 	}
 
 	kind := strings.ToLower(o.GetObjectKind().GroupVersionKind().Kind)
-	finalizer := kind + finalizerSuffix
-
-	// Add a finalizer
-	if !controllerutil.ContainsFinalizer(o, finalizer) {
-		log.Info("Adding Finalizer for Object")
-		controllerutil.AddFinalizer(o, finalizer)
-
-		if err := r.Update(ctx, o); err != nil {
-			log.Error(err, "Failed to update custom resource to add finalizer")
-			return ctrl.Result{}, err
-		}
-	}
 
 	// Initialize the stack
 	program := o.GetPulumiProgram()
-
 	s, err := stack.GetStack(ctx, program, kind, o.GetName(), o.GetNamespace())
 	if err != nil {
 		log.Error(err, "failed to create stack")
 		return ctrl.Result{}, nil
 	}
 
+	finalizer := kind + finalizerSuffix
+
 	// Check if the Object instance is marked to be deleted, which is
 	// indicated by the deletion timestamp being set.
-	if o.GetDeletionTimestamp() != nil {
+	if o.GetDeletionTimestamp() == nil {
+		// Add a finalizer
+		if !controllerutil.ContainsFinalizer(o, finalizer) {
+			log.Info("Adding Finalizer for Object")
+			controllerutil.AddFinalizer(o, finalizer)
+
+			if err := r.Update(ctx, o); err != nil {
+				log.Error(err, "Failed to update custom resource to add finalizer")
+				return ctrl.Result{}, err
+			}
+		}
+	} else {
+		// Delete the stack
 		if controllerutil.ContainsFinalizer(o, finalizer) {
 			log.Info("Performing Finalizer Operations for Object before delete CR")
 
 			// Set the Ready condition to "False" to reflect that this resource began its process to be terminated.
-			if err := setReadyStatus(ctx, metav1.ConditionFalse, o, req, r, "Finalizing", fmt.Sprintf("Performing finalizer operations for the custom resource: %s", o.GetName()), false); err != nil {
+			if err := setReadyStatus(ctx, metav1.ConditionFalse, o, r, "Finalizing", fmt.Sprintf("Performing finalizer operations for the custom resource: %s", o.GetName())); err != nil {
 				log.Error(err, "Failed to update Object status")
 				return ctrl.Result{}, err
 			}
@@ -104,13 +113,7 @@ func Reconcile(ctx context.Context, o Obj, req ctrl.Request, r client.Client) (c
 			}
 			log.Info("successfully destroyed stack", s.Name(), outBuf.String())
 
-			// Re-fetch the Object before updating the status
-			if err := r.Get(ctx, req.NamespacedName, o); err != nil {
-				log.Error(err, "Failed to re-fetch Object")
-				return ctrl.Result{}, err
-			}
-
-			if err := setReadyStatus(ctx, metav1.ConditionFalse, o, req, r, "Finalizing", fmt.Sprintf("Finalizer operations for custom resource %s name were successfully accomplished", o.GetName()), true); err != nil {
+			if err := setReadyStatus(ctx, metav1.ConditionFalse, o, r, "Finalizing", fmt.Sprintf("Finalizer operations for custom resource %s name were successfully accomplished", o.GetName())); err != nil {
 				log.Error(err, "Failed to update Object status")
 				return ctrl.Result{}, err
 			}
@@ -149,7 +152,7 @@ func Reconcile(ctx context.Context, o Obj, req ctrl.Request, r client.Client) (c
 	}
 	log.Info("detected changes to apply", "stack", s.Name())
 	// Set the Ready condition to "False" to reflect that this resource is being reconciled.
-	if err := setReadyStatus(ctx, metav1.ConditionFalse, o, req, r, "Reconciling", "Starting reconciliation", true); err != nil {
+	if err := setReadyStatus(ctx, metav1.ConditionFalse, o, r, "Reconciling", "Starting reconciliation"); err != nil {
 		log.Error(err, "Failed to update Object status")
 		return ctrl.Result{}, err
 	}
@@ -165,14 +168,13 @@ func Reconcile(ctx context.Context, o Obj, req ctrl.Request, r client.Client) (c
 	log.Info("successfully deployed/updated stack", s.Name(), outBuf.String())
 
 	o.SetStatus(upRes.Outputs)
-
 	if err = r.Status().Update(ctx, o); err != nil {
 		log.Error(err, "Failed to update Object status")
 		return ctrl.Result{}, err
 	}
 
 	// Set the Ready condtion to "True" to reflect that this resource is created.
-	if err := setReadyStatus(ctx, metav1.ConditionTrue, o, req, r, "Created", "The Object was successfully created", false); err != nil {
+	if err := setReadyStatus(ctx, metav1.ConditionTrue, o, r, "Created", "The Object was successfully created"); err != nil {
 		log.Error(err, "Failed to update Object status")
 		return ctrl.Result{}, err
 	}
@@ -180,23 +182,19 @@ func Reconcile(ctx context.Context, o Obj, req ctrl.Request, r client.Client) (c
 	return ctrl.Result{}, nil
 }
 
-func setReadyStatus(ctx context.Context, status metav1.ConditionStatus, o Obj, req ctrl.Request, r client.Client, resason, message string, reFetch bool) error {
-	meta.SetStatusCondition(o.GetStatusConditions(), metav1.Condition{
+func setReadyStatus(ctx context.Context, status metav1.ConditionStatus, o Obj, r client.Client, resason, message string) error {
+	if changed := meta.SetStatusCondition(o.GetStatusConditions(), metav1.Condition{
 		Type:    conditionTypeReady,
 		Status:  status,
 		Reason:  resason,
 		Message: message,
-	})
+	}); !changed {
+		return nil
+	}
 
 	if err := r.Status().Update(ctx, o); err != nil {
 		return err
 	}
 
-	// Re-fetch the Object after updating the status
-	if reFetch {
-		if err := r.Get(ctx, req.NamespacedName, o); err != nil {
-			return err
-		}
-	}
 	return nil
 }
